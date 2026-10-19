@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>mtl_landing</name>
+  <version>0.1.0</version>
+  <description>
+    Vision-based landing of a quadcopter on a moving target (ArUco pad), after
+    Wickramanayake et al., "Landing a Quadcopter on to a moving landing target using
+    Computer Vision". Includes a headless simulator with a rendered downward camera,
+    the paper's estimator (as published) and a corrected estimator for comparison.
+  </description>
+  <maintainer email="16587863+deBilla@users.noreply.github.com">Dimuthu Wickramanayake</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>rosgraph_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
