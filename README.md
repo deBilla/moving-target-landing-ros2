@@ -78,6 +78,7 @@ literally so the effect can be measured.
 
 ```bash
 docker build -f docker/Dockerfile -t mtl_landing:jazzy .        # once
+docker/run_lab.sh                            # interactive sim lab on http://localhost:8765
 docker/run_ros_sim.sh weave corrected        # full ROS 2 graph, one landing
 docker/run_ros_sim.sh straight paper         # same, flown with the printed formulas read literally
 
@@ -98,6 +99,47 @@ Without that, parallel runs discover each other over DDS and mix their `/clock` 
 On a machine with ROS 2 Jazzy installed you can skip Docker: `colcon build` the workspace
 and run `ros2 launch mtl_landing landing_sim.launch.py scenario:=circle mode:=corrected`.
 RViz can show the `/tf` frames (`world`, `base_link`, `pad`) and `/camera/debug`.
+
+## Interactive sim lab
+
+`docker/run_lab.sh` starts a local web UI on http://localhost:8765. It runs the same
+simulator, ArUco detector, estimators and landing controller live, with every parameter
+on a slider:
+
+- **Vehicle:** pick a scenario or drive it yourself (speed and turn rate).
+- **Environment:** gusts and steady wind.
+- **Drone:** velocity response, tilt and acceleration limits, attitude and velocity noise.
+- **Camera:** field of view, resolution, frame rate, latency, noise, blur, minimum marker size.
+- **Landing pad:** the three marker sizes.
+- **Estimation:** which variant flies the drone, plus the Kalman filter settings.
+- **Landing controller:** gains, heights, the drop rules and timeouts.
+
+Most knobs apply immediately; the ones marked "on reset" apply after Reset. The page shows
+the onboard camera with detections, a top view with every estimator's guess of the pad
+position, and rolling charts of height, offset and relative speed (truth against each
+estimator). Pause, Step (0.1 s) and simulation speed control are in the header.
+
+### Hosting it on a k3s server
+
+`.github/workflows/deploy-sim-lab.yml` deploys the lab to a k3s cluster over SSH:
+
+- **Pull requests:** unit tests and chart validation.
+- **Push to `main`:** also builds `docker/lab.Dockerfile` (no ROS, just numpy and OpenCV)
+  to `ghcr.io/<owner>/sim-lab:<sha>`, then runs `helm upgrade` with the chart in
+  `deploy/helm/sim-lab`.
+
+The chart adds its own Gateway and HTTPRoute on k3s's Traefik. With a Cloudflare tunnel
+pointed at the host's port 80, adding a public hostname to the tunnel is the only
+network change needed.
+
+The server details (SSH target, public hostname, where to copy the image pull secret
+from) come from secrets on a `deploy` environment; the header of the workflow lists them.
+They are secrets rather than variables because Actions logs of a public repo are public,
+and only secrets are masked.
+
+The hosted lab runs with `LAB_PUBLIC=1`. Everyone shares one simulation, so the costly
+knobs are capped, viewers are capped at 20, and nothing is simulated while no one has
+the page open.
 
 ## Validation results
 

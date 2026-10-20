@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Landing Sim Lab</title>
+<style>
+  /* Layout: knob panel on the left, live views and charts on the right. One dark theme (bench instrument). */
+  :root {
+    --bg: #0f1413; --panel: #161d1b; --panel-2: #1c2523; --ink: #e5ece9; --ink-2: #a6b3ae; --muted: #6f7d78;
+    --rule: #28322f; --accent: #5cc6b5;
+    --s-truth: #c9d2ce; --s-corr: #3987e5; --s-paper: #d95926; --s-naive: #199e70; --s-comp: #c98500;
+    --good: #3fb26f; --warn: #d9a441; --bad: #e66767;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--ink); font: 13px/1.45 var(--sans); display: grid; grid-template-rows: auto 1fr; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; padding: 10px 16px; border-bottom: 1px solid var(--rule); background: var(--panel); }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; letter-spacing: .01em; }
+  button { font: 500 12px/1 var(--mono); padding: 8px 10px; border-radius: 4px; border: 1px solid var(--rule); background: var(--panel-2); color: var(--ink); cursor: pointer; }
+  button:hover { border-color: var(--muted); }
+  button.primary { background: var(--accent); color: #062420; border-color: var(--accent); }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .clock { font: 500 13px var(--mono); font-variant-numeric: tabular-nums; min-width: 8ch; }
+  .pill { font: 600 11px/1 var(--mono); letter-spacing: .06em; padding: 5px 8px; border-radius: 99px; border: 1px solid currentColor; }
+  .outcome { font: 12px var(--mono); color: var(--ink-2); }
+  .outcome b { font-weight: 600; }
+  .viewers { margin-left: auto; font: 11px var(--mono); color: var(--muted); }
+  main { display: grid; grid-template-columns: 330px minmax(0, 1fr); min-height: 0; }
+  aside { border-right: 1px solid var(--rule); overflow-y: auto; padding: 8px 0 40px; background: var(--panel); }
+  details { border-bottom: 1px solid var(--rule); }
+  summary { cursor: pointer; padding: 10px 16px; font-weight: 600; font-size: 12px; letter-spacing: .04em; text-transform: uppercase; color: var(--ink-2); list-style: none; display: flex; justify-content: space-between; }
+  summary::after { content: "+"; color: var(--muted); }
+  details[open] summary::after { content: "–"; }
+  .knob { padding: 6px 16px 8px; display: grid; gap: 4px; }
+  .knob label { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--ink); }
+  .knob label output { font: 12px var(--mono); color: var(--accent); font-variant-numeric: tabular-nums; }
+  .knob .reset-tag { font: 10px var(--mono); color: var(--warn); margin-left: 6px; }
+  .knob input[type=range] { width: 100%; accent-color: var(--accent); }
+  .knob select { width: 100%; background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule); border-radius: 4px; padding: 6px; font: 12px var(--mono); }
+  .knob .help { font-size: 11px; color: var(--muted); }
+  .knob.changed label > span:first-child { color: var(--accent); }
+  .pending { margin: 10px 16px; padding: 8px 10px; border: 1px solid var(--warn); border-radius: 4px; color: var(--warn); font: 12px var(--mono); }
+  section.views { overflow-y: auto; padding: 14px; display: grid; gap: 14px; align-content: start; }
+  .row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 10px; display: grid; gap: 8px; min-width: 0; }
+  .card h2 { margin: 0; font: 600 11px/1.2 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); display: flex; justify-content: space-between; gap: 8px; }
+  .cam { background: #000; border-radius: 4px; height: clamp(220px, 38vh, 420px); overflow: hidden; }
+  .cam img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  canvas { width: 100%; display: block; }
+  #top { height: clamp(220px, 38vh, 420px); border-radius: 4px; }
+  .chart { height: 150px; }
+  .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+  .stats div { display: grid; gap: 2px; }
+  .stats span { font: 10px var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .stats b { font: 500 15px var(--mono); font-variant-numeric: tabular-nums; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font: 11px var(--mono); color: var(--ink-2); }
+  .legend i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+  @media (max-width: 1000px) { main { grid-template-columns: 1fr; } aside { max-height: 45vh; border-right: 0; border-bottom: 1px solid var(--rule); } .row { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Landing Sim Lab</h1>
+  <button id="play" class="primary" type="button">Pause</button>
+  <button id="step" type="button" title="Advance 0.1 s">Step</button>
+  <button id="reset" type="button">Reset</button>
+  <button id="defaults" type="button">Defaults</button>
+  <span class="clock" id="clock">0.0 s</span>
+  <span class="pill" id="pill">–</span>
+  <span class="outcome" id="outcome"></span>
+  <span class="viewers" id="viewers"></span>
+</header>
+<main>
+  <aside id="knobs" aria-label="Parameters"></aside>
+  <section class="views">
+    <div class="row">
+      <div class="card">
+        <h2><span>Onboard camera</span><span id="ids">no markers</span></h2>
+        <div class="cam"><img id="cam" alt="Live downward camera frame with detected ArUco markers outlined"></div>
+      </div>
+      <div class="card">
+        <h2><span>Top view · follows the vehicle · 1 m grid</span><span id="mode"></span></h2>
+        <canvas id="top"></canvas>
+      </div>
+    </div>
+    <div class="card">
+      <div class="stats">
+        <div><span>Camera height</span><b id="s-h">–</b></div>
+        <div><span>Offset to pad</span><b id="s-e">–</b></div>
+        <div><span>Tilt</span><b id="s-tilt">–</b></div>
+        <div><span>Pad speed</span><b id="s-v">–</b></div>
+        <div><span>Relative speed</span><b id="s-rv">–</b></div>
+        <div><span>Detection rate</span><b id="s-det">–</b></div>
+        <div><span>Aborts</span><b id="s-ab">–</b></div>
+        <div><span>Drop impact</span><b id="s-imp">–</b></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2><span>Camera height above pad, m · state band below</span></h2>
+      <canvas id="c-h" class="chart"></canvas>
+    </div>
+    <div class="card">
+      <h2><span>Horizontal offset to pad, m · truth vs each estimator</span></h2>
+      <canvas id="c-e" class="chart"></canvas>
+      <div class="legend" id="lg-e"></div>
+    </div>
+    <div class="card">
+      <h2><span>Relative speed, m/s · truth vs each estimator (clipped at 8)</span></h2>
+      <canvas id="c-v" class="chart"></canvas>
+      <div class="legend" id="lg-v"></div>
+    </div>
+  </section>
+</main>
+<script>
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const STATE = { SEARCH: '--muted', TRACK: '--s-corr', DESCEND: '--s-naive', FINAL: '--s-comp', CUT: '--s-paper', LANDED: '--good', ABORT: '--bad' };
+const EST = { corrected: ['--s-corr', 'tilt-comp + Kalman'], compensated: ['--s-comp', 'tilt-compensated'], naive: ['--s-naive', 'plain distance'], paper: ['--s-paper', 'printed formulas'] };
+const fmt = (x, d = 2) => x == null || !isFinite(x) ? '–' : Number(x).toFixed(d);
+const WINDOW = 30;   // seconds shown in the charts
+let hist = [], last = null, values = {}, schema = [], resetNeeded = false;
+
+const post = (url, body) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json());
+
+// ---------------- knobs ----------------
+async function buildKnobs() {
+  const r = await (await fetch('/schema')).json();
+  schema = r.schema; values = r.values;
+  const root = document.getElementById('knobs');
+  root.innerHTML = '<div class="pending" id="pending" hidden>Some changes apply on Reset.</div>';
+  schema.forEach((g, gi) => {
+    const d = document.createElement('details'); d.open = gi < 3;
+    d.innerHTML = `<summary>${g.group}</summary>`;
+    for (const it of g.items) {
+      const k = document.createElement('div'); k.className = 'knob'; k.dataset.key = it.key;
+      const id = 'k-' + it.key, v = values[it.key];
+      const tag = it.reset ? '<span class="reset-tag">on reset</span>' : '';
+      if (it.type === 'select') {
+        k.innerHTML = `<label for="${id}"><span>${it.label}${tag}</span></label><select id="${id}">${it.options.map(o => `<option${o === v ? ' selected' : ''}>${o}</option>`).join('')}</select>`;
+      } else {
+        k.innerHTML = `<label for="${id}"><span>${it.label}${tag}</span><output>${v}</output></label><input type="range" id="${id}" min="${it.min}" max="${it.max}" step="${it.step}" value="${v}">`;
+      }
+      if (it.help) k.insertAdjacentHTML('beforeend', `<span class="help">${it.help}</span>`);
+      const input = k.querySelector('input,select');
+      const send = async () => {
+        const val = it.type === 'select' ? input.value : Number(input.value);
+        const out = k.querySelector('output'); if (out) out.textContent = val;
+        k.classList.toggle('changed', val != it.default);
+        const res = await post('/params', { [it.key]: val });
+        if (res.needs_reset) { resetNeeded = true; document.getElementById('pending').hidden = false; }
+      };
+      input.addEventListener(it.type === 'select' ? 'change' : 'input', send);
+      k.classList.toggle('changed', v != it.default);
+      d.appendChild(k);
+    }
+    root.appendChild(d);
+  });
+}
+
+// ---------------- controls ----------------
+const playBtn = document.getElementById('play');
+playBtn.onclick = () => post('/cmd', { action: last && last.running ? 'pause' : 'play' });
+document.getElementById('step').onclick = () => post('/cmd', { action: 'step' });
+document.getElementById('reset').onclick = async () => { await post('/cmd', { action: 'reset' }); hist = []; resetNeeded = false; document.getElementById('pending').hidden = true; };
+document.getElementById('defaults').onclick = async () => { await post('/cmd', { action: 'defaults' }); hist = []; await buildKnobs(); };
+
+// ---------------- stream ----------------
+function connect() {
+  const es = new EventSource('/stream');
+  es.onmessage = ev => {
+    const s = JSON.parse(ev.data);
+    if (last && s.t < last.t) hist = [];
+    last = s;
+    hist.push(s);
+    while (hist.length && hist[0].t < s.t - WINDOW) hist.shift();
+    if (s.frame) document.getElementById('cam').src = 'data:image/jpeg;base64,' + s.frame;
+    render(s);
+  };
+  es.onerror = () => { es.close(); setTimeout(connect, 1000); };
+}
+
+function fit(c) {
+  const r = c.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  const w = Math.round(r.width * dpr), h = Math.round(r.height * dpr);
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.font = `11px ${css('--mono')}`;
+  return [g, r.width, r.height];
+}
+
+function render(s) {
+  document.getElementById('clock').textContent = fmt(s.t, 1) + ' s';
+  document.getElementById('viewers').textContent = s.public
+    ? `Shared run: ${s.viewers} viewer${s.viewers === 1 ? '' : 's'} see and change the same simulation` : '';
+  playBtn.textContent = s.running ? 'Pause' : 'Play';
+  const pill = document.getElementById('pill'); pill.textContent = s.state; pill.style.color = `var(${STATE[s.state] || '--muted'})`;
+  const o = s.outcome;
+  document.getElementById('outcome').innerHTML = o ? `<b style="color:var(${o.result === 'landed' ? '--good' : '--bad'})">${o.result.replace('_', ' ')}</b> at ${fmt(o.t, 1)} s · ${fmt(o.err * 100, 0)} cm from centre · impact ${fmt(o.vz)} m/s` : '';
+  document.getElementById('ids').textContent = s.ids.length ? 'markers ' + s.ids.join(', ') : 'no markers';
+  document.getElementById('mode').textContent = 'flying on: ' + (EST[s.mode] || [, s.mode])[1];
+  const set = (id, v) => document.getElementById(id).textContent = v;
+  set('s-h', fmt(s.hcam) + ' m'); set('s-e', fmt(Math.hypot(s.rel[0], s.rel[1])) + ' m'); set('s-tilt', fmt(s.tilt, 1) + '°');
+  set('s-v', fmt(s.tgt_speed, 1) + ' m/s'); set('s-rv', fmt(s.rel_speed, 2) + ' m/s'); set('s-det', fmt(s.det_rate * 100, 0) + '%');
+  set('s-ab', s.aborts); set('s-imp', s.impact && s.state === 'FINAL' ? fmt(Math.hypot(...s.impact) * 100, 0) + ' cm' : '–');
+  drawTop(s); drawHeight(); drawSeries('c-e', 'lg-e', x => Math.hypot(x.rel[0], x.rel[1]), k => x => x.ests[k] && x.ests[k].rel ? Math.hypot(...x.ests[k].rel) : null, 3);
+  drawSeries('c-v', 'lg-v', x => x.rel_speed, k => x => x.ests[k] ? x.ests[k].speed : null, 8);
+}
+
+function drawTop(s) {
+  const [g, W, H] = fit(document.getElementById('top'));
+  const [tx, ty] = s.pad.p, S = Math.min(W, H) / 10, cx = W / 2, cy = H / 2;
+  const P = (x, y) => [cx + (x - tx) * S, cy - (y - ty) * S];
+  g.fillStyle = css('--panel-2'); g.fillRect(0, 0, W, H);
+  g.strokeStyle = css('--rule'); g.lineWidth = 1; g.beginPath();
+  for (let x = Math.floor(tx - W / S); x <= tx + W / S; x++) { const [px] = P(x, 0); g.moveTo(px, 0); g.lineTo(px, H); }
+  for (let y = Math.floor(ty - H / S); y <= ty + H / S; y++) { const [, py] = P(0, y); g.moveTo(0, py); g.lineTo(W, py); }
+  g.stroke();
+  const trail = (get, col) => { g.strokeStyle = col; g.lineWidth = 2; g.beginPath(); hist.forEach((x, i) => { const [a, b] = P(...get(x)); i ? g.lineTo(a, b) : g.moveTo(a, b); }); g.stroke(); };
+  trail(x => x.pad.p, css('--muted'));
+  trail(x => x.drone.p, css(STATE[s.state] || '--s-corr'));
+  g.save(); const [px, py] = P(tx, ty); g.translate(px, py); g.rotate(-(s.pad.yaw - Math.PI / 2));
+  g.fillStyle = '#4a5653'; g.fillRect(-0.8 * S, -0.65 * S, 1.6 * S, 1.3 * S);
+  g.fillStyle = '#e9eeec'; g.fillRect(-0.5 * S, -0.5 * S, S, S);
+  g.fillStyle = '#0b0b0b'; for (const [sz, mx, my] of s.pad.markers) g.fillRect((mx - sz / 2) * S, (-my - sz / 2) * S, sz * S, sz * S);
+  g.restore();
+  // estimated pad position from each estimator (relative to the drone)
+  const [dx, dy] = s.drone.p;
+  for (const [k, e] of Object.entries(s.ests)) {
+    if (!e.rel || e.rel[0] == null) continue;
+    const [ex, ey] = P(dx + e.rel[0], dy + e.rel[1]);
+    g.strokeStyle = css(EST[k][0]); g.lineWidth = 2; g.beginPath(); g.moveTo(ex - 6, ey); g.lineTo(ex + 6, ey); g.moveTo(ex, ey - 6); g.lineTo(ex, ey + 6); g.stroke();
+  }
+  const [qx, qy] = P(dx, dy), hc = s.hcam || 0, col = css(STATE[s.state] || '--s-corr'), arm = 0.25 * S * (1 + Math.min(hc, 8) * 0.06);
+  g.fillStyle = 'rgba(0,0,0,.3)'; g.beginPath(); g.arc(qx + hc * 3, qy + hc * 3, 0.32 * S, 0, 7); g.fill();
+  g.strokeStyle = col; g.lineWidth = 3; g.beginPath(); g.moveTo(qx - arm, qy - arm); g.lineTo(qx + arm, qy + arm); g.moveTo(qx + arm, qy - arm); g.lineTo(qx - arm, qy + arm); g.stroke();
+  g.lineWidth = 2; for (const [ax, ay] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) { g.beginPath(); g.arc(qx + ax * arm, qy + ay * arm, arm * .45, 0, 7); g.stroke(); }
+  if (s.impact && s.state === 'FINAL') { g.strokeStyle = css('--s-comp'); g.setLineDash([3, 3]); g.beginPath(); g.arc(qx + s.impact[0] * S, qy - s.impact[1] * S, 0.12 * S, 0, 7); g.stroke(); g.setLineDash([]); }
+  g.fillStyle = css('--ink-2'); g.fillText('+ estimated pad position, one per estimator', 10, 16);
+}
+
+function axes(g, W, H, yMax, ticks, pad) {
+  const t1 = last.t, span = Math.min(WINDOW, Math.max(5, t1 - hist[0].t)), t0 = t1 - span;
+  const X = t => pad.l + (t - t0) / span * (W - pad.l - pad.r), Y = v => H - pad.b - Math.min(v, yMax) / yMax * (H - pad.t - pad.b);
+  g.clearRect(0, 0, W, H); g.strokeStyle = css('--rule'); g.fillStyle = css('--muted'); g.lineWidth = 1;
+  for (const v of ticks) { g.beginPath(); g.moveTo(pad.l, Y(v)); g.lineTo(W - pad.r, Y(v)); g.stroke(); g.fillText(v, 6, Y(v) + 4); }
+  return [X, Y];
+}
+function line(g, X, Y, get, col, w, dash) {
+  g.strokeStyle = col; g.lineWidth = w; g.setLineDash(dash || []); g.beginPath(); let pen = false;
+  for (const x of hist) { const v = get(x); if (v == null || !isFinite(v)) { pen = false; continue; } pen ? g.lineTo(X(x.t), Y(v)) : g.moveTo(X(x.t), Y(v)); pen = true; }
+  g.stroke(); g.setLineDash([]);
+}
+function drawHeight() {
+  const c = document.getElementById('c-h'), [g, W, H] = fit(c), pad = { l: 30, r: 6, t: 6, b: 18 };
+  const yMax = Math.max(7, ...hist.map(x => x.hcam || 0)) ;
+  const [X, Y] = axes(g, W, H, yMax, [0, 2, 4, 6], pad);
+  for (let i = 1; i < hist.length; i++) { g.fillStyle = css(STATE[hist[i].state] || '--muted'); g.fillRect(X(hist[i - 1].t), H - pad.b + 6, X(hist[i].t) - X(hist[i - 1].t) + 0.5, 6); }
+  line(g, X, Y, x => Math.max(0, x.hcam), css('--s-corr'), 2);
+}
+function drawSeries(id, lgId, truth, est, yMax) {
+  const [g, W, H] = fit(document.getElementById(id)), pad = { l: 30, r: 6, t: 6, b: 8 };
+  const [X, Y] = axes(g, W, H, yMax, yMax > 4 ? [0, 2, 4, 6, 8] : [0, 1, 2, 3], pad);
+  for (const k of ['paper', 'naive', 'compensated', 'corrected']) line(g, X, Y, est(k), css(EST[k][0]), k === last.mode ? 2.5 : 1.2);
+  line(g, X, Y, truth, css('--s-truth'), 1.5, [4, 3]);
+  document.getElementById(lgId).innerHTML = `<span><i style="background:var(--s-truth)"></i>truth</span>` + Object.entries(EST).map(([k, [c, n]]) => `<span><i style="background:var(${c})"></i>${n}${k === last.mode ? ' (flying)' : ''}</span>`).join('');
+}
+
+window.addEventListener('resize', () => last && render(last));
+buildKnobs().then(connect);
+</script>
+</body>
+</html>

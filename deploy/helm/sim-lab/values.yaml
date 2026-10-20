@@ -1,0 +1,26 @@
+image:
+  repository: ""     # set by CI, e.g. ghcr.io/<owner>/sim-lab
+  tag: ""            # set by CI to the commit SHA
+  pullSecret: ghcr-pull
+
+# One shared simulation per pod, so this stays at 1.
+replicas: 1
+port: 8765
+
+env:
+  LAB_PUBLIC: "1"        # caps the costly knobs; everyone shares one run
+  LAB_MAX_CLIENTS: "20"
+
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+  # The sim only runs while someone has the page open; the cap keeps a busy page
+  # from crowding out other workloads on a small server.
+  limits: { cpu: "1500m", memory: 512Mi }
+
+# Public HTTP through k3s's bundled Traefik (Gateway API). With a Cloudflare tunnel
+# the path is tunnel -> host :80 -> Traefik "web" entrypoint (container port 8000).
+gateway:
+  enabled: true
+  className: traefik
+  port: 8000
+  hostnames: []          # set by CI from a secret

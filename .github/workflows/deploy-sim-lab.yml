@@ -1,0 +1,228 @@
+name: Deploy sim lab to k3s
+
+# PRs: unit tests + chart validation. Push to main (and manual dispatch): also build
+# the image to GHCR and `helm upgrade` on a k3s server reached over SSH.
+#
+# Nothing that identifies the server lives in this repo. Configure the `deploy`
+# environment (Settings > Environments) with:
+#   secrets   DEPLOY_HOST                   user@host for ssh
+#             SSH_CONFIG                    ssh config for that host (e.g. a ProxyCommand)
+#             KNOWN_HOSTS                   known_hosts line(s) for that host
+#             SERVER_SSH_PRIVATE_KEY        private key authorised on the host
+#             SIM_LAB_HOSTNAME              public hostname routed to the cluster's Traefik
+#             PULL_SECRET_SOURCE_NAMESPACE  namespace holding an existing GHCR pull secret
+#   variables SIM_LAB_NAMESPACE             (optional, default sim-lab)
+#             PULL_SECRET_NAME              (optional, default ghcr-pull)
+# Identifying values are secrets rather than variables because Actions logs of a
+# public repo are public, and only secrets are masked in them.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ros2_ws/src/mtl_landing/**'
+      - 'tools/sim_lab/**'
+      - 'docker/lab.Dockerfile'
+      - 'deploy/helm/sim-lab/**'
+      - '.github/workflows/deploy-sim-lab.yml'
+  pull_request:
+    paths:
+      - 'ros2_ws/src/mtl_landing/**'
+      - 'tools/sim_lab/**'
+      - 'docker/lab.Dockerfile'
+      - 'deploy/helm/sim-lab/**'
+      - '.github/workflows/deploy-sim-lab.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-sim-lab-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  HELM_VERSION: v4.1.3
+  KUBECONFORM_VERSION: v0.7.0
+  K8S_VERSION: 1.36.0
+  CHART_DIR: deploy/helm/sim-lab
+  RELEASE: sim-lab
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Unit tests (simulator core)
+        run: |
+          pip install "numpy==2.2.6" "opencv-contrib-python-headless==4.10.0.84" pytest
+          cd ros2_ws/src/mtl_landing
+          PYTHONPATH=. python -m pytest -q test
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install kubeconform
+        run: |
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin kubeconform
+
+      - name: Lint and validate rendered manifests
+        env:
+          # Gateway API kinds aren't in the core schemas.
+          CRD_SCHEMAS: https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json
+          CI_VALUES: --set image.repository=ghcr.io/example/sim-lab --set image.tag=ci --set gateway.hostnames[0]=sim.example.com
+        run: |
+          # shellcheck disable=SC2086
+          helm lint "$CHART_DIR" $CI_VALUES
+          # shellcheck disable=SC2086
+          helm template "$RELEASE" "$CHART_DIR" $CI_VALUES \
+            | kubeconform -strict -summary -kubernetes-version "$K8S_VERSION" \
+                -schema-location default -schema-location "$CRD_SCHEMAS"
+
+  build:
+    needs: [test, chart]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/sim-lab" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/lab.Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.image.outputs.name }}:${{ github.sha }}
+          cache-from: type=gha,scope=sim-lab
+          cache-to: type=gha,mode=max,scope=sim-lab
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: deploy
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      SIM_LAB_HOSTNAME: ${{ secrets.SIM_LAB_HOSTNAME }}
+      PULL_SECRET_SOURCE_NAMESPACE: ${{ secrets.PULL_SECRET_SOURCE_NAMESPACE }}
+      PULL_SECRET_NAME: ${{ vars.PULL_SECRET_NAME || 'ghcr-pull' }}
+      NAMESPACE: ${{ vars.SIM_LAB_NAMESPACE || 'sim-lab' }}
+    steps:
+      - name: Check configuration
+        run: |
+          for k in DEPLOY_HOST SIM_LAB_HOSTNAME PULL_SECRET_SOURCE_NAMESPACE; do
+            [ -n "${!k}" ] || { echo "::error::secret $k is not set on the deploy environment"; exit 1; }
+          done
+          # The bare host name can show up in ssh errors; mask it too, not just user@host.
+          echo "::add-mask::${DEPLOY_HOST#*@}"
+
+      - uses: actions/checkout@v4
+
+      # The server is reached through a Cloudflare tunnel (SSH_CONFIG holds the ProxyCommand).
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SERVER_SSH_PRIVATE_KEY }}
+
+      - name: Add SSH config and known hosts
+        env:
+          KNOWN_HOSTS: ${{ secrets.KNOWN_HOSTS }}
+          SSH_CONFIG: ${{ secrets.SSH_CONFIG }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$KNOWN_HOSTS" >> ~/.ssh/known_hosts
+          printf '%s\n' "$SSH_CONFIG" >> ~/.ssh/config
+
+      - name: Check cluster is ready
+        run: |
+          ssh -q "$DEPLOY_HOST" 'command -v helm >/dev/null && kubectl get gatewayclass traefik >/dev/null' \
+            || { echo "::error::helm or the Traefik GatewayClass isn't available on the server"; exit 1; }
+
+      # Copies an existing GHCR pull secret into this namespace, so this repo needs no
+      # registry token of its own. The value is copied in-cluster and never leaves the server.
+      - name: Namespace and image pull secret
+        run: |
+          ssh -q "$DEPLOY_HOST" "set -e; umask 077; f=\$(mktemp); trap 'rm -f \$f' EXIT
+            kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+            kubectl -n $PULL_SECRET_SOURCE_NAMESPACE get secret $PULL_SECRET_NAME \
+              -o go-template='{{index .data \".dockerconfigjson\"}}' | base64 -d > \$f
+            kubectl -n $NAMESPACE create secret generic $PULL_SECRET_NAME --type=kubernetes.io/dockerconfigjson \
+              --from-file=.dockerconfigjson=\$f --dry-run=client -o yaml | kubectl apply -f - >/dev/null"
+
+      - name: Upload chart
+        run: |
+          tar -C "$(dirname "$CHART_DIR")" -cz "$(basename "$CHART_DIR")" \
+            | ssh -q "$DEPLOY_HOST" 'rm -rf ~/sim-lab-chart && mkdir -p ~/sim-lab-chart && tar -xz -C ~/sim-lab-chart'
+
+      - name: Helm upgrade
+        run: |
+          ssh -q "$DEPLOY_HOST" "helm upgrade --install $RELEASE ~/sim-lab-chart/$(basename "$CHART_DIR") \
+            --namespace $NAMESPACE \
+            --set image.repository=$IMAGE \
+            --set image.tag=$GITHUB_SHA \
+            --set image.pullSecret=$PULL_SECRET_NAME \
+            --set 'gateway.hostnames[0]=$SIM_LAB_HOSTNAME' \
+            --rollback-on-failure --timeout 5m >/dev/null"
+
+      - name: Smoke test through Traefik
+        run: |
+          ssh -q "$DEPLOY_HOST" "curl -fsS --max-time 5 -o /dev/null -H 'Host: $SIM_LAB_HOSTNAME' http://localhost/health" \
+            || { echo "::error::Traefik doesn't route the sim lab hostname to the sim lab"; exit 1; }
+          echo "sim lab answers on its hostname"
+
+      # Kept to names and states: Gateway/HTTPRoute detail would print hostnames and node addresses.
+      - name: Show release state
+        if: always()
+        run: |
+          ssh -q "$DEPLOY_HOST" "helm -n $NAMESPACE history $RELEASE --max 5; \
+            kubectl -n $NAMESPACE get deploy,pods"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          ssh -q "$DEPLOY_HOST" "kubectl -n $NAMESPACE get events --sort-by=.lastTimestamp | tail -30; \
+            kubectl -n $NAMESPACE logs deploy/$RELEASE --tail=50 || true"
+
+  cleanup-images:
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/delete-package-versions@v5
+        with:
+          package-name: sim-lab
+          package-type: container
+          min-versions-to-keep: 10

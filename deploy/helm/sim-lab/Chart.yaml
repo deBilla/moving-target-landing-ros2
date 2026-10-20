@@ -1,0 +1,6 @@
+apiVersion: v2
+name: sim-lab
+description: Interactive landing simulator (moving-target-landing-ros2) for a k3s cluster with Traefik
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

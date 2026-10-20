@@ -1,0 +1,41 @@
+{{- if .Values.gateway.enabled }}
+# Its own Gateway on Traefik's "web" entrypoint, so it doesn't depend on (or change)
+# any other release's Gateway; Traefik serves several Gateways on the same port.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    {{- include "simlab.labels" . | nindent 4 }}
+spec:
+  gatewayClassName: {{ .Values.gateway.className }}
+  listeners:
+    # Plain HTTP: TLS ends at Cloudflare and the tunnel connects over localhost.
+    - name: http
+      protocol: HTTP
+      port: {{ .Values.gateway.port }}
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    {{- include "simlab.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .Release.Name }}
+      sectionName: http
+  hostnames:
+    {{- required "gateway.hostnames needs at least one hostname" .Values.gateway.hostnames | toYaml | nindent 4 }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: {{ .Release.Name }}
+          port: {{ .Values.port }}
+{{- end }}
