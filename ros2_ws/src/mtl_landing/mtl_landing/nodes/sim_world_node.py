@@ -16,7 +16,6 @@ Subscribes
 import json
 
 import numpy as np
-import rclpy
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import TransformStamped, Twist
 from nav_msgs.msg import Odometry
@@ -29,6 +28,7 @@ from tf2_ros import TransformBroadcaster
 
 from mtl_landing.core.geometry import R_to_quat
 from mtl_landing.core.world import World, WorldConfig
+from mtl_landing.nodes.common import spin
 
 
 def to_time(t):
@@ -145,15 +145,7 @@ class SimWorld(Node):
 
 
 def main():
-    rclpy.init()
-    node = SimWorld()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.try_shutdown()
+    spin(SimWorld)
 
 
 if __name__ == '__main__':

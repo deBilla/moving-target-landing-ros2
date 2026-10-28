@@ -1,9 +1,10 @@
 """Closed-loop simulation without ROS, for Monte Carlo runs.
 
-Same World / PadDetector / estimators / LandingController as the ROS nodes. The ROS
-graph's asynchrony is replaced by an explicit camera rate and processing latency, and
-all three estimators run in parallel on every detection so their errors can be compared
-against ground truth on identical images. Only the selected `mode` drives the controller.
+Same World / PadDetector / estimators / LandingController as the ROS nodes, driven by
+LandingPipeline. The ROS graph's asynchrony is replaced by an explicit camera rate and
+processing latency, and all estimators run in parallel on every detection so their errors
+can be compared against ground truth on identical images. Only the selected `mode` drives
+the controller.
 """
 import argparse
 import json
@@ -12,20 +13,48 @@ import time
 import cv2
 import numpy as np
 
-from .controller import LandingController, LandingParams
-from .detector import PadDetector, draw_detection
-from .estimation import ESTIMATORS, DroneStateBuffer
+from .detector import draw_detection
+from .estimation import ESTIMATORS
+from .pipeline import LandingPipeline, PipelineConfig, PipelineObserver
+from .state import rounded as _f
 from .world import World, WorldConfig
 
 
-def _f(x):
-    """JSON-safe float / list."""
-    if x is None:
-        return None
-    a = np.asarray(x, float)
-    if a.ndim == 0:
-        return None if not np.isfinite(a) else round(float(a), 4)
-    return [None if not np.isfinite(v) else round(float(v), 4) for v in a]
+class _EpisodeRecorder(PipelineObserver):
+    """Per-frame and per-detection logs of one episode."""
+
+    def __init__(self, camera_K, snapshot_every=0, snapshot_width=240):
+        self.K = camera_K
+        self.snapshot_every, self.snapshot_width = snapshot_every, snapshot_width
+        self.est_log, self.snaps, self.frames_log = [], [], []
+        self.n_frames = self.n_det = 0
+        self.marker_use = {}
+
+    def on_frame(self, t, img, det, truth):
+        self.n_frames += 1
+        tr_img = _truth_row(truth)
+        self.frames_log.append((round(t, 3), tr_img['cam_height'], tr_img['tilt_deg'],
+                                det.marker_ids if det is not None else []))
+        if det is not None:
+            self.n_det += 1
+            key = f'{det.primary_id}'
+            self.marker_use[key] = self.marker_use.get(key, 0) + 1
+        if self.snapshot_every and self.n_frames % self.snapshot_every == 0:
+            dbg = draw_detection(img, det, self.K)
+            hgt = int(self.snapshot_width * dbg.shape[0] / dbg.shape[1])
+            small = cv2.resize(dbg, (self.snapshot_width, hgt), interpolation=cv2.INTER_AREA)
+            ok, jpg = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            self.snaps.append(dict(t=round(t, 3), jpg=jpg.tobytes(),
+                                   ids=det.marker_ids if det else []))
+
+    def on_estimates(self, t_img, det, outs, truth):
+        row = dict(t=round(t_img, 4), ids=det.marker_ids, primary=det.primary_id,
+                   reproj=round(det.reproj_err_px, 3),
+                   tvec=_f(det.tvec), tvec_single=_f(det.tvec_single))
+        for k, out in outs.items():
+            row[k] = out.summary()
+        row['truth'] = _truth_row(truth)
+        self.est_log.append(row)
 
 
 def run_episode(scenario='straight', mode='corrected', seed=0, t_max=90.0, cam_hz=30.0,
@@ -33,90 +62,17 @@ def run_episode(scenario='straight', mode='corrected', seed=0, t_max=90.0, cam_h
                 snapshot_width=240, world_cfg=None, verbose=False):
     cfg = world_cfg or WorldConfig(scenario=scenario, seed=seed, wind_sigma=wind_sigma)
     world = World(cfg)
-    detector = PadDetector(world.camera.K, world.camera.dist)
-    ests = {k: cls() for k, cls in ESTIMATORS.items()}
-    ctrl = LandingController(LandingParams())
-    buf = DroneStateBuffer()
-
-    pending = []            # (t_ready, t_img, det, truth at t_img)
-    log, est_log, snaps, frames_log = [], [], [], []
-    v_cmd, motors = np.zeros(3), True
-    next_cam, next_ctrl, next_log = 0.0, 0.0, 0.0
-    frame_idx = 0
-    n_frames = n_det = 0
-    marker_use = {}
+    rec = _EpisodeRecorder(world.camera.K, snapshot_every, snapshot_width)
+    pipe = LandingPipeline(world, PipelineConfig(mode=mode, cam_hz=cam_hz, latency=latency,
+                                                 ctrl_hz=ctrl_hz, dt=dt), observers=[rec])
+    ctrl = pipe.controller
+    log = []
+    next_log = 0.0
     wall0 = time.time()
-    t_end = None
 
     while world.t < t_max:
         t = world.t
-        p_fc, v_fc, R_fc = world.fc_estimate()
-        buf.add(t, p_fc, v_fc, R_fc)
-        drone_now = (t, p_fc, v_fc, R_fc)
-
-        # camera
-        if t >= next_cam - 1e-9:
-            next_cam += 1.0 / cam_hz
-            img = world.render()
-            det = detector.detect(img)
-            n_frames += 1
-            frame_idx += 1
-            tr_img = _truth_row(world.truth())
-            frames_log.append((round(t, 3), tr_img['cam_height'], tr_img['tilt_deg'],
-                               det.marker_ids if det is not None else []))
-            if det is not None:
-                n_det += 1
-                key = f'{det.primary_id}'
-                marker_use[key] = marker_use.get(key, 0) + 1
-            pending.append((t + latency, t, det, tr_img))
-            if snapshot_every and frame_idx % snapshot_every == 0:
-                dbg = draw_detection(img, det, world.camera.K)
-                hgt = int(snapshot_width * dbg.shape[0] / dbg.shape[1])
-                small = cv2.resize(dbg, (snapshot_width, hgt), interpolation=cv2.INTER_AREA)
-                ok, jpg = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 60])
-                snaps.append(dict(t=round(t, 3), jpg=jpg.tobytes(),
-                                  ids=det.marker_ids if det else []))
-
-        # detections become available after the processing latency
-        while pending and pending[0][0] <= t + 1e-9:
-            _, t_img, det, tr = pending.pop(0)
-            if det is None:
-                continue
-            drone_img = buf.at(t_img)
-            row = dict(t=round(t_img, 4), ids=det.marker_ids, primary=det.primary_id,
-                       reproj=round(det.reproj_err_px, 3),
-                       tvec=_f(det.tvec), tvec_single=_f(det.tvec_single))
-            for k, e in ests.items():
-                out = e.update(t_img, det, drone_img)
-                if out is not None:
-                    row[k] = dict(speed=_f(out['speed']), heading=_f(out['heading']),
-                                  altitude=_f(out['altitude']), rel_pos=_f(out['rel_pos']),
-                                  rel_vel=_f(out['rel_vel']), tgt_vel=_f(out['tgt_vel']))
-            row['truth'] = tr
-            est_log.append(row)
-
-        # controller
-        if t >= next_ctrl - 1e-9:
-            next_ctrl += 1.0 / ctrl_hz
-            est = ests[mode].predict(t, drone_now)
-            if est is not None and mode != 'corrected':
-                # paper/naive keep their last value; treat >0.5 s old as lost
-                if t - est['t'] > 0.5:
-                    est = None
-            if world.outcome is None:
-                v_cmd, motors = ctrl.step(t, est, p_fc, v_fc)
-
-        world.step(dt, v_cmd, motors)
-
-        # give up once the pad has been out of sight for 10 s after it was first tracked
-        if (world.outcome is None and ctrl.state == 'SEARCH' and ctrl.t_last_seen is not None
-                and t - ctrl.t_last_seen > 10.0):
-            world.outcome = dict(result='lost_target', t=world.t, err=np.nan, vz=np.nan, vxy=np.nan)
-            t_end = world.t
-        if world.outcome is not None and t_end is None:
-            ctrl.touchdown(world.t)
-            t_end = world.t + 1.0
-
+        pipe.step()
         if t >= next_log - 1e-9:
             next_log += 0.05
             tr = world.truth()
@@ -124,19 +80,21 @@ def run_episode(scenario='straight', mode='corrected', seed=0, t_max=90.0, cam_h
                             dp=_f(tr['drone_p']), dv=_f(tr['drone_v']),
                             att=_f([tr['roll'], tr['pitch'], tr['yaw']]),
                             tp=_f(tr['tgt_p']), tv=_f(tr['tgt_v']), tyaw=_f(tr['tgt_yaw']),
-                            cmd=_f(v_cmd), motors=bool(motors), hcam=_f(tr['cam_height']),
-                            impact=_f(ctrl.predicted_impact) if ctrl.predicted_impact is not None else None))
-        if t_end is not None and world.t >= t_end:
+                            cmd=_f(pipe.v_cmd), motors=bool(pipe.motors), hcam=_f(tr['cam_height']),
+                            impact=_f(ctrl.predicted_impact)))
+        # after a touchdown keep simulating 1 s so the logs show it
+        if pipe.t_end is not None and world.t >= pipe.t_end + (1.0 if pipe.touched_down else 0.0):
             break
 
-    outcome = world.outcome or dict(result='timeout', t=world.t, err=np.nan, vz=np.nan, vxy=np.nan)
-    summary = dict(scenario=cfg.scenario, mode=mode, seed=cfg.seed, outcome=outcome,
-                   aborts=ctrl.n_aborts, frames=n_frames, detections=n_det,
-                   detection_rate=n_det / max(1, n_frames), marker_use=marker_use,
+    world.end('timeout')
+    summary = dict(scenario=cfg.scenario, mode=mode, seed=cfg.seed, outcome=world.outcome,
+                   aborts=ctrl.n_aborts, frames=rec.n_frames, detections=rec.n_det,
+                   detection_rate=rec.n_det / max(1, rec.n_frames), marker_use=rec.marker_use,
                    wall_s=round(time.time() - wall0, 1))
     if verbose:
         print(json.dumps(summary, default=float))
-    return dict(summary=summary, log=log, est_log=est_log, snaps=snaps, frames_log=frames_log)
+    return dict(summary=summary, log=log, est_log=rec.est_log, snaps=rec.snaps,
+                frames_log=rec.frames_log)
 
 
 def _truth_row(tr):

@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 
 from .geometry import P_BODY_CAM, R_BODY_CAM
-from .pad import PAD_SIZE_M, make_pad_texture, texture_to_plane
+from .pad import DEFAULT_PAD, PadLayout, texture_to_plane
 
 
 class PinholeCamera:
@@ -62,7 +62,7 @@ class SceneRenderer:
     GROUND_TILE_PX = 400        # tile period: 10 m
 
     def __init__(self, camera: PinholeCamera, deck_size=(1.6, 1.3), seed=0,
-                 noise_std=3.0, blur_sigma=0.6, gain=1.0):
+                 noise_std=3.0, blur_sigma=0.6, gain=1.0, layout: PadLayout = DEFAULT_PAD):
         self.cam = camera
         rng = np.random.default_rng(seed)
         self.rng = rng
@@ -83,7 +83,7 @@ class SceneRenderer:
         self.deck = _Plane(deck_tex, dw, dh, dpx)
 
         ppm = 1000
-        self.pad = _Plane(make_pad_texture(ppm), PAD_SIZE_M, PAD_SIZE_M, ppm)
+        self.pad = _Plane(layout.texture(ppm), layout.size, layout.size, ppm)
 
     def _H(self, R_wc, p_wc, R_wp, p_wp, S):
         R_cp = R_wc.T @ R_wp

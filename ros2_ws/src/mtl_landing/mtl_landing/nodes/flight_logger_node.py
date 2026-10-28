@@ -9,16 +9,14 @@ import os
 
 import cv2
 import numpy as np
-import rclpy
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
-
-def stamp_s(stamp):
-    return stamp.sec + stamp.nanosec * 1e-9
+from mtl_landing.core.geometry import P_BODY_CAM
+from mtl_landing.nodes.common import spin, stamp_s
 
 
 def odom_arrays(m):
@@ -71,7 +69,7 @@ class FlightLogger(Node):
                                 rel_v=np.round(rel_v, 4).tolist(),
                                 rel_speed=round(float(np.hypot(*rel_v[:2])), 4),
                                 tgt_v=tv, tgt_speed=round(float(np.hypot(*tv[:2])), 4),
-                                cam_height=round(dp[2] - 0.05 - tp[2], 4))
+                                cam_height=round(dp[2] + P_BODY_CAM[2] - tp[2], 4))
         return row
 
     def _on_outcome(self, m):
@@ -99,7 +97,7 @@ class FlightLogger(Node):
         self.log.append(dict(t=round(t, 3), state=self.state.get('state', 'INIT'),
                              aborts=self.state.get('aborts', 0), impact=self.state.get('impact'),
                              dp=dp, dv=dv, tp=tp, tv=tv, q=[round(q.x, 4), round(q.y, 4), round(q.z, 4), round(q.w, 4)],
-                             hcam=round(dp[2] - 0.05 - tp[2], 3)))
+                             hcam=round(dp[2] + P_BODY_CAM[2] - tp[2], 3)))
         if (self.t_outcome is not None and t - self.t_outcome > 1.5) or t > self.t_max:
             self._write()
 
@@ -116,15 +114,7 @@ class FlightLogger(Node):
 
 
 def main():
-    rclpy.init()
-    node = FlightLogger()
-    try:
-        rclpy.spin(node)
-    except (KeyboardInterrupt, SystemExit):
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.try_shutdown()
+    spin(FlightLogger)
 
 
 if __name__ == '__main__':

@@ -6,12 +6,11 @@ follows with a first-order lag. That keeps the coupling that matters in closed-l
 to accelerate sideways the drone has to tilt, and the downward camera tilts with it.
 """
 from dataclasses import dataclass, field
+from typing import Callable
 
 import numpy as np
 
-from .geometry import euler_to_R, rot_z, wrap_angle
-
-G = 9.81
+from .geometry import G, euler_to_R, rot_z, wrap_angle
 
 
 @dataclass
@@ -104,25 +103,37 @@ def _smooth_step(x):
     return x * x * (3 - 2 * x)
 
 
+@dataclass(frozen=True)
+class Scenario:
+    """How the vehicle drives: forward speed and yaw rate as functions of time."""
+    speed: Callable[[float], float]          # [m/s]
+    yaw_rate: Callable[[float], float]       # [rad/s]
+    description: str = ''
+
+    @classmethod
+    def constant(cls, speed, yaw_rate=0.0, description=''):
+        return cls(lambda t: speed, lambda t: yaw_rate,
+                   description or f'Constant {speed:g} m/s')
+
+
 SCENARIOS = {
-    # name: (speed(t) [m/s], yaw_rate(t) [rad/s], description)
-    'static': (lambda t: 0.0, lambda t: 0.0, 'Stationary pad (baseline)'),
-    'straight': (lambda t: 2.0, lambda t: 0.0, 'Constant 2 m/s, straight line'),
-    'accelerating': (lambda t: 0.5 + 3.0 * _smooth_step((t - 5.0) / 20.0), lambda t: 0.0,
-                     '0.5 -> 3.5 m/s ramp over 20 s'),
-    'circle': (lambda t: 2.5, lambda t: 2.5 / 15.0, '2.5 m/s on a 15 m radius circle'),
-    'weave': (lambda t: 2.5, lambda t: 0.35 * np.sin(2 * np.pi * t / 8.0),
-              '2.5 m/s lane-change weave, 8 s period'),
-    'stop_go': (lambda t: 3.0 * _smooth_step(np.sin(2 * np.pi * t / 16.0) * 2.0), lambda t: 0.0,
-                'Stop-and-go traffic, 0 <-> 3 m/s'),
-    'fast': (lambda t: 4.5, lambda t: 0.0, 'Constant 4.5 m/s'),
+    'static': Scenario.constant(0.0, description='Stationary pad (baseline)'),
+    'straight': Scenario.constant(2.0, description='Constant 2 m/s, straight line'),
+    'accelerating': Scenario(lambda t: 0.5 + 3.0 * _smooth_step((t - 5.0) / 20.0), lambda t: 0.0,
+                             '0.5 -> 3.5 m/s ramp over 20 s'),
+    'circle': Scenario.constant(2.5, 2.5 / 15.0, '2.5 m/s on a 15 m radius circle'),
+    'weave': Scenario(lambda t: 2.5, lambda t: 0.35 * np.sin(2 * np.pi * t / 8.0),
+                      '2.5 m/s lane-change weave, 8 s period'),
+    'stop_go': Scenario(lambda t: 3.0 * _smooth_step(np.sin(2 * np.pi * t / 16.0) * 2.0),
+                        lambda t: 0.0, 'Stop-and-go traffic, 0 <-> 3 m/s'),
+    'fast': Scenario.constant(4.5, description='Constant 4.5 m/s'),
 }
 
 
 class GroundVehicle:
-    def __init__(self, scenario='straight', deck_height=0.35, p0=(0.0, 0.0), yaw0=0.0):
-        self.speed_fn, self.yaw_rate_fn, self.description = SCENARIOS[scenario]
+    def __init__(self, scenario: Scenario, deck_height=0.35, p0=(0.0, 0.0), yaw0=0.0):
         self.scenario = scenario
+        self.description = scenario.description
         self.deck_height = deck_height
         self.p = np.array([p0[0], p0[1], deck_height], float)
         self.yaw = yaw0
@@ -130,8 +141,8 @@ class GroundVehicle:
         self.v = np.zeros(3)
 
     def step(self, dt):
-        sp = float(self.speed_fn(self.t))
-        self.yaw = wrap_angle(self.yaw + float(self.yaw_rate_fn(self.t)) * dt)
+        sp = float(self.scenario.speed(self.t))
+        self.yaw = wrap_angle(self.yaw + float(self.scenario.yaw_rate(self.t)) * dt)
         self.v = np.array([sp * np.cos(self.yaw), sp * np.sin(self.yaw), 0.0])
         self.p = self.p + self.v * dt
         self.t += dt

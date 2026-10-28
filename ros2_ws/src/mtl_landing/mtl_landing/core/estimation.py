@@ -1,6 +1,7 @@
 """Relative-state estimation of the moving pad (paper Sec. III-C).
 
-Four estimators share one interface so they can be compared on identical detections:
+Four estimators share one interface (Estimator) so they can be compared on identical
+detections:
 
 PaperEstimator         - the Sec. III-C formulas coded literally as printed:
                            d     = sqrt((tx1^2 + ty1^2) - (tx2^2 + ty2^2))
@@ -28,46 +29,61 @@ Notes on the step from measuring speed to closed-loop flight (see README):
   (4) rvec from solvePnP is a Rodrigues axis-angle vector; cv2.Rodrigues turns it into the
       rotation used for (3).
 """
+from abc import ABC, abstractmethod
 from collections import deque
 
 import cv2
 import numpy as np
 
 from .geometry import P_BODY_CAM, R_BODY_CAM, R_to_euler
+from .state import DroneState, Estimate
 
 
-class EstimateOut(dict):
-    """Plain dict with the fields every estimator reports (NaN when unknown).
+class Estimator(ABC):
+    """One way of turning pad detections into an Estimate for the controller.
 
-    rel_pos   : target - drone, world frame, horizontal components used by the controller
-    rel_vel   : relative velocity (target - drone), world frame
-    tgt_vel   : target ground velocity (only CorrectedEstimator can provide it)
-    speed     : scalar relative speed the estimator reports
-    heading   : direction of target motion [rad]
-    altitude  : drone height above the pad
+    update()  - feed a detection taken at time t (drone = flight-controller state at t).
+    predict() - the estimate to fly on at time t, or None when there is nothing usable.
+    Each estimator decides itself when its estimate is too old to use.
     """
+    name = ''
+
+    @abstractmethod
+    def update(self, t, det, drone: DroneState = None) -> Estimate | None:
+        ...
+
+    @abstractmethod
+    def predict(self, t, drone: DroneState = None) -> Estimate | None:
+        ...
 
 
-def _nan3():
-    return np.full(3, np.nan)
-
-
-class PaperEstimator:
-    name = 'paper'
+class LastFixEstimator(Estimator):
+    """Reports only at camera fixes and holds the last value, for at most max_hold s."""
+    max_hold = 0.5
 
     def __init__(self):
         self.prev = None
         self.last = None
+
+    def predict(self, t, drone=None):
+        if self.last is None or t - self.last.t > self.max_hold:
+            return None
+        return self.last
+
+
+class PaperEstimator(LastFixEstimator):
+    name = 'paper'
+
+    def __init__(self):
+        super().__init__()
         self.n_updates = 0
         self.n_undefined = 0
 
     def update(self, t, det, drone=None):
         tx, ty, tz = det.tvec
-        out = EstimateOut(t=t, rel_pos=_nan3(), rel_vel=_nan3(), tgt_vel=_nan3(),
-                          speed=np.nan, heading=np.nan, altitude=tz, valid=True)
         # Paper has no camera->body mapping; the minimal one for a down-looking camera
         # (camera x right = -body y, camera y down = -body x), drone assumed level.
-        out['rel_pos'] = np.array([-ty, -tx, -tz])
+        out = Estimate(t=t, rel_pos=np.array([-ty, -tx, -tz]), altitude=tz)
         if self.prev is not None:
             t1, (tx1, ty1, _) = self.prev
             tx2, ty2 = tx, ty
@@ -79,80 +95,60 @@ class PaperEstimator:
                 rel_dist = np.nan
             else:
                 rel_dist = np.sqrt(d2)
-            out['speed'] = rel_dist / duration if duration > 0 else np.nan
+            out.speed = rel_dist / duration if duration > 0 else np.nan
             ratio = ty / tx if abs(tx) > 1e-9 else np.nan
-            out['angle_ratio'] = ratio
-            out['heading'] = np.arctan(ratio)   # most charitable reading of "angle = ty/tx"
-            if np.isfinite(out['speed']) and np.isfinite(out['heading']):
+            out.angle_ratio = ratio
+            out.heading = np.arctan(ratio)   # most charitable reading of "angle = ty/tx"
+            if np.isfinite(out.speed) and np.isfinite(out.heading):
                 # direction (cos a, sin a) in camera x/y, mapped to body x/y
-                ca, sa = np.cos(out['heading']), np.sin(out['heading'])
-                out['rel_vel'] = out['speed'] * np.array([-sa, -ca, 0.0])
-                out['heading'] = float(np.arctan2(-ca, -sa))
+                ca, sa = np.cos(out.heading), np.sin(out.heading)
+                out.rel_vel = out.speed * np.array([-sa, -ca, 0.0])
+                out.heading = float(np.arctan2(-ca, -sa))
         self.prev = (t, det.tvec.copy())
         self.last = out
         return out
 
-    def predict(self, t, drone=None):
-        return self.last
 
-
-class PlainDistanceEstimator:
+class PlainDistanceEstimator(LastFixEstimator):
     """Plain distance and atan2, in the camera frame with raw finite differences."""
     name = 'naive'
-
-    def __init__(self):
-        self.prev = None
-        self.last = None
 
     def update(self, t, det, drone=None):
         tx, ty, tz = det.tvec
         rel_body = np.array([-ty, -tx, -tz])
-        out = EstimateOut(t=t, rel_pos=rel_body, rel_vel=_nan3(), tgt_vel=_nan3(),
-                          speed=np.nan, heading=np.nan, altitude=tz, valid=True)
+        out = Estimate(t=t, rel_pos=rel_body, altitude=tz)
         if self.prev is not None:
             t1, p1 = self.prev
             dt = t - t1
             if dt > 0:
                 v = (rel_body - p1) / dt
-                out['rel_vel'] = v
-                out['speed'] = float(np.hypot(v[0], v[1]))
-                out['heading'] = float(np.arctan2(v[1], v[0]))
+                out.rel_vel = v
+                out.speed = float(np.hypot(v[0], v[1]))
+                out.heading = float(np.arctan2(v[1], v[0]))
         self.prev = (t, rel_body)
         self.last = out
         return out
 
-    def predict(self, t, drone=None):
-        return self.last
 
-
-class CompensatedEstimator:
+class CompensatedEstimator(LastFixEstimator):
     """Ablation: tilt/frame compensation (as CorrectedEstimator) but raw finite differences."""
     name = 'compensated'
 
-    def __init__(self):
-        self.prev = None
-        self.last = None
-
-    def update(self, t, det, drone):
+    def update(self, t, det, drone=None):
         if drone is None:
             return None
         z, _ = CorrectedEstimator.measurement(det, drone)
-        _, p_d, v_d, _ = drone
-        rel = z - p_d
-        out = EstimateOut(t=t, rel_pos=rel, rel_vel=_nan3(), tgt_vel=_nan3(), speed=np.nan,
-                          heading=np.nan, altitude=float(-rel[2] + P_BODY_CAM[2]), valid=True)
+        rel = z - drone.p
+        out = Estimate(t=t, rel_pos=rel, altitude=float(-rel[2] + P_BODY_CAM[2]))
         if self.prev is not None and t > self.prev[0]:
             v_t = (z - self.prev[1]) / (t - self.prev[0])
-            out['tgt_vel'] = v_t
-            out['rel_vel'] = v_t - v_d
-            out['speed'] = float(np.hypot(*out['rel_vel'][:2]))
-            out['heading'] = float(np.arctan2(v_t[1], v_t[0]))
+            out.tgt_vel = v_t
+            out.rel_vel = v_t - drone.v
+            out.speed = float(np.hypot(*out.rel_vel[:2]))
+            out.heading = float(np.arctan2(v_t[1], v_t[0]))
         self.prev = (t, z)
         self.last = out
         return out
-
-    def predict(self, t, drone=None):
-        return self.last
 
 
 class DroneStateBuffer:
@@ -162,19 +158,19 @@ class DroneStateBuffer:
         self.buf = deque(maxlen=maxlen)
 
     def add(self, t, p, v, R):
-        self.buf.append((t, np.asarray(p, float), np.asarray(v, float), np.asarray(R, float)))
+        self.buf.append(DroneState(t, np.asarray(p, float), np.asarray(v, float),
+                                   np.asarray(R, float)))
 
-    def at(self, t):
+    def at(self, t) -> DroneState | None:
         if not self.buf:
             return None
-        best = min(self.buf, key=lambda e: abs(e[0] - t))
-        return best
+        return min(self.buf, key=lambda e: abs(e.t - t))
 
-    def latest(self):
+    def latest(self) -> DroneState | None:
         return self.buf[-1] if self.buf else None
 
 
-class CorrectedEstimator:
+class CorrectedEstimator(Estimator):
     name = 'corrected'
 
     def __init__(self, accel_noise=2.0, meas_base=0.02, meas_per_m=0.012, gate_chi2=16.0,
@@ -211,13 +207,14 @@ class CorrectedEstimator:
         self.t = t
 
     @staticmethod
-    def measurement(det, drone):
+    def measurement(det, drone: DroneState):
         """World-frame pad position from tvec and the drone pose at the image time."""
-        _, p_d, _, R_wb = drone
         p_rel_body = R_BODY_CAM @ det.tvec + P_BODY_CAM
-        return p_d + R_wb @ p_rel_body, R_wb
+        return drone.p + drone.R @ p_rel_body, drone.R
 
-    def update(self, t, det, drone):
+    def update(self, t, det, drone=None):
+        if drone is None:
+            return None
         z, R_wb = self.measurement(det, drone)
         rng = float(np.linalg.norm(det.tvec))
         sig = self.meas_base + self.meas_per_m * rng
@@ -263,16 +260,15 @@ class CorrectedEstimator:
             return None
         if t > self.t:
             self._predict_to(t)
-        _, p_d, v_d, _ = drone
         p_t, v_t = self.x[:3], self.x[3:]
-        rel_pos = p_t - p_d
-        rel_vel = v_t - v_d
-        out = EstimateOut(
+        rel_pos = p_t - drone.p
+        rel_vel = v_t - drone.v
+        out = Estimate(
             t=t, rel_pos=rel_pos, rel_vel=rel_vel, tgt_vel=v_t.copy(),
             speed=float(np.hypot(rel_vel[0], rel_vel[1])),
             heading=float(np.arctan2(v_t[1], v_t[0])),
             # report camera height (like tz) so all estimators feed the controller alike
-            altitude=float(-rel_pos[2] + P_BODY_CAM[2]), valid=True, pad_yaw=self.pad_yaw,
+            altitude=float(-rel_pos[2] + P_BODY_CAM[2]), pad_yaw=self.pad_yaw,
             age=t - self.t_meas, pos_std=float(np.sqrt(np.trace(self.P[:2, :2]) / 2)))
         self.last = out
         return out

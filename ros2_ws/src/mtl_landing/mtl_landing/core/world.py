@@ -2,19 +2,20 @@
 
 Shared by the ROS `sim_world` node and the batch runner, so both run the same physics.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
 from .camera import PinholeCamera, SceneRenderer
-from .dynamics import GroundVehicle, QuadParams, Quadrotor, WindModel
-from .geometry import euler_to_R
-from .pad import PAD_SIZE_M
+from .dynamics import SCENARIOS, GroundVehicle, QuadParams, Quadrotor, Scenario, WindModel
+from .geometry import P_BODY_CAM, euler_to_R
+from .pad import DEFAULT_PAD, PadLayout
 
 
 @dataclass
 class WorldConfig:
-    scenario: str = 'straight'
+    scenario: str = 'straight'   # name in SCENARIOS, used unless `motion` is given
+    motion: Scenario | None = None  # custom vehicle motion; overrides `scenario`
     seed: int = 0
     drone_start: tuple = (-2.0, 1.5, 6.0)
     vehicle_start: tuple = (0.0, 0.0)
@@ -28,6 +29,13 @@ class WorldConfig:
     att_jitter_deg: float = 0.05 # white attitude noise per sample
     vel_noise: float = 0.05
     pos_drift: float = 0.02      # m/sqrt(s) random walk of own-position estimate
+    quad: QuadParams = field(default_factory=QuadParams)
+    deck_height: float = 0.35    # deck top above ground [m]
+    deck_size: tuple = (1.6, 1.3)  # deck footprint across x, along y of the pad frame [m]
+    pad: PadLayout = DEFAULT_PAD
+
+    def vehicle_motion(self) -> Scenario:
+        return self.motion if self.motion is not None else SCENARIOS[self.scenario]
 
 
 class World:
@@ -35,12 +43,13 @@ class World:
         self.cfg = cfg
         self.rng = np.random.default_rng(cfg.seed)
         self.t = 0.0
-        self.quad = Quadrotor(QuadParams(), p0=cfg.drone_start)
-        self.vehicle = GroundVehicle(cfg.scenario, p0=cfg.vehicle_start)
+        self.quad = Quadrotor(cfg.quad, p0=cfg.drone_start)
+        self.vehicle = GroundVehicle(cfg.vehicle_motion(), deck_height=cfg.deck_height,
+                                     p0=cfg.vehicle_start)
         self.wind = WindModel(self.rng, sigma=cfg.wind_sigma, mean=cfg.wind_mean)
         self.camera = PinholeCamera(cfg.cam_width, cfg.cam_height, cfg.cam_hfov_deg)
-        self.renderer = SceneRenderer(self.camera, seed=cfg.seed,
-                                      gain=float(self.rng.uniform(0.85, 1.1)))
+        self.renderer = SceneRenderer(self.camera, deck_size=cfg.deck_size, seed=cfg.seed,
+                                      gain=float(self.rng.uniform(0.85, 1.1)), layout=cfg.pad)
         self.pos_bias = np.zeros(3)
         self.att_bias = np.zeros(3)
         self.outcome = None          # dict once the episode ends
@@ -65,16 +74,22 @@ class World:
         self.att_bias += -k * self.att_bias + np.radians(self.cfg.att_noise_deg) * np.sqrt(2 * k) * self.rng.normal(size=3)
         self._contact()
 
+    def end(self, result):
+        """End the episode without contact (e.g. 'lost_target', 'timeout')."""
+        if self.outcome is None:
+            self.outcome = dict(result=result, t=self.t, err=np.nan, vz=np.nan, vxy=np.nan)
+
     def _contact(self):
         if self.outcome is not None:
             return
         s, prm = self.quad.s, self.quad.prm
         skid_z = s.p[2] - prm.leg_length
         off_pad = self.vehicle.R_deck.T @ (s.p - self.vehicle.p)
-        on_deck = abs(off_pad[0]) < 0.8 and abs(off_pad[1]) < 0.65
+        deck_w, deck_l = self.cfg.deck_size
+        on_deck = abs(off_pad[0]) < deck_w / 2.0 and abs(off_pad[1]) < deck_l / 2.0
         if on_deck and skid_z <= self.vehicle.p[2]:
             v_rel = s.v - self.vehicle.v
-            on_pad = max(abs(off_pad[0]), abs(off_pad[1])) <= PAD_SIZE_M / 2.0
+            on_pad = max(abs(off_pad[0]), abs(off_pad[1])) <= self.cfg.pad.size / 2.0
             err = float(np.hypot(off_pad[0], off_pad[1]))
             vz = float(-v_rel[2])
             vxy = float(np.hypot(v_rel[0], v_rel[1]))
@@ -114,5 +129,5 @@ class World:
                     tgt_speed=float(np.hypot(veh.v[0], veh.v[1])),
                     tgt_heading=float(np.arctan2(veh.v[1], veh.v[0])) if np.hypot(
                         veh.v[0], veh.v[1]) > 0.05 else np.nan,
-                    cam_height=float(s.p[2] - 0.05 - veh.p[2]),
+                    cam_height=float(s.p[2] + P_BODY_CAM[2] - veh.p[2]),
                     motors_on=s.motors_on)

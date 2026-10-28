@@ -11,7 +11,6 @@ import json
 
 import cv2
 import numpy as np
-import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
@@ -20,6 +19,7 @@ from std_msgs.msg import String
 
 from mtl_landing.core.detector import PadDetector, draw_detection
 from mtl_landing.core.geometry import R_to_quat
+from mtl_landing.nodes.common import spin, stamp_s
 
 
 class ArucoDetectorNode(Node):
@@ -57,7 +57,7 @@ class ArucoDetectorNode(Node):
             p.pose.orientation.x, p.pose.orientation.y, p.pose.orientation.z, p.pose.orientation.w = map(float, q)
             self.pub_pose.publish(p)
             self.pub_det.publish(String(data=json.dumps(dict(
-                t=msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
+                t=stamp_s(msg.header.stamp),
                 ids=det.marker_ids, primary=det.primary_id,
                 reproj=round(det.reproj_err_px, 3),
                 tvec_single=[round(float(x), 4) for x in det.tvec_single]))))
@@ -70,15 +70,7 @@ class ArucoDetectorNode(Node):
 
 
 def main():
-    rclpy.init()
-    node = ArucoDetectorNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.try_shutdown()
+    spin(ArucoDetectorNode)
 
 
 if __name__ == '__main__':
