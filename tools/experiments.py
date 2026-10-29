@@ -20,53 +20,49 @@ from multiprocessing import Pool
 import cv2
 import numpy as np
 
-from mtl_landing.core.detector import PadDetector
-from mtl_landing.core.estimation import ESTIMATORS, DroneStateBuffer
+from mtl_landing.core.dynamics import SCENARIOS as SCENARIO_DEFS, Scenario
+from mtl_landing.core.estimation import ESTIMATORS
+from mtl_landing.core.pipeline import LandingPipeline, PipelineConfig, PipelineObserver
 from mtl_landing.core.sim_runner import run_episode
 from mtl_landing.core.world import World, WorldConfig
 
 OUT = os.environ.get('RESULTS_DIR', '/results')
-MODES = ['paper', 'naive', 'compensated', 'corrected']
-SCENARIOS = ['static', 'straight', 'accelerating', 'circle', 'weave', 'stop_go', 'fast']
+MODES = list(ESTIMATORS)
+SCENARIOS = list(SCENARIO_DEFS)
 
 
 # ---------------------------------------------------------------------------------------
 # E1 - speed sweep
 # ---------------------------------------------------------------------------------------
+class _SpeedRows(PipelineObserver):
+    """Each estimator's speed and heading per detection, with the truth at image time."""
+
+    def __init__(self):
+        self.rows = []
+
+    def on_estimates(self, t_img, det, outs, tr):
+        row = dict(truth_rel_speed=tr['rel_speed'], truth_tgt_speed=tr['tgt_speed'],
+                   tilt=float(np.degrees(np.hypot(tr['roll'], tr['pitch']))))
+        for k in ESTIMATORS:
+            o = outs.get(k)
+            row[k] = (np.nan if o is None else float(o.speed),
+                      np.nan if o is None else float(o.heading))
+        self.rows.append(row)
+
+
 def speed_trial(args):
     speed, seed, height = args
-    cfg = WorldConfig(scenario='straight', seed=seed, drone_start=(0.0, 0.0, height + 0.45),
-                      vehicle_start=(-8.0, 0.6), wind_sigma=0.6)
+    cfg = WorldConfig(scenario='straight', motion=Scenario.constant(speed), seed=seed,
+                      drone_start=(0.0, 0.0, height + 0.45), vehicle_start=(-8.0, 0.6),
+                      wind_sigma=0.6)
     w = World(cfg)
-    w.vehicle.speed_fn = lambda t: speed
-    det_ = PadDetector(w.camera.K)
-    ests = {k: c() for k, c in ESTIMATORS.items()}
-    buf = DroneStateBuffer()
+    rec = _SpeedRows()
+    pipe = LandingPipeline(w, PipelineConfig(give_up_after=None), observers=[rec])
     hold = np.array(cfg.drone_start)
-    dt, next_cam, latency = 0.005, 0.0, 0.05
-    rows = []
-    pending = []
     while w.vehicle.p[0] < 8.0 and w.t < 60:
-        p, v, R = w.fc_estimate()
-        buf.add(w.t, p, v, R)
-        if w.t >= next_cam - 1e-9:
-            next_cam += 1 / 30.0
-            d = det_.detect(w.render())
-            tr = w.truth()
-            pending.append((w.t + latency, w.t, d, tr))
-        while pending and pending[0][0] <= w.t:
-            _, ti, d, tr = pending.pop(0)
-            if d is None:
-                continue
-            row = dict(truth_rel_speed=tr['rel_speed'], truth_tgt_speed=tr['tgt_speed'],
-                       tilt=float(np.degrees(np.hypot(tr['roll'], tr['pitch']))))
-            for k, e in ests.items():
-                o = e.update(ti, d, buf.at(ti))
-                row[k] = (np.nan if o is None else float(o['speed']),
-                          np.nan if o is None else float(o['heading']))
-            rows.append(row)
         # position hold (the paper's drone hovered while the vehicle drove past)
-        w.step(dt, 1.5 * (hold - w.quad.s.p), True)
+        pipe.step(command=(1.5 * (hold - w.quad.s.p), True))
+    rows = rec.rows
     out = dict(speed=speed, seed=seed, n=len(rows))
     tgt_heading = 0.0
     for k in ESTIMATORS:

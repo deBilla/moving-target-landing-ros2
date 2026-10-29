@@ -28,11 +28,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cv2
 import numpy as np
 
-from mtl_landing.core import pad as padmod
-from mtl_landing.core.controller import LandingController, LandingParams
-from mtl_landing.core.detector import PadDetector, draw_detection
-from mtl_landing.core.dynamics import SCENARIOS
-from mtl_landing.core.estimation import ESTIMATORS, DroneStateBuffer
+from mtl_landing.core.controller import LandingParams
+from mtl_landing.core.detector import draw_detection
+from mtl_landing.core.dynamics import SCENARIOS, Scenario
+from mtl_landing.core.estimation import ESTIMATORS
+from mtl_landing.core.pad import PadLayout, PadMarker
+from mtl_landing.core.pipeline import LandingPipeline, PipelineConfig, PipelineObserver
+from mtl_landing.core.state import rounded
 from mtl_landing.core.world import World, WorldConfig
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -130,6 +132,43 @@ ITEMS = {it['key']: it for g in SCHEMA for it in g['items']}
 CTRL_KEYS = {f.name for f in fields(LandingParams)}
 
 
+def pad_layout(large, medium, small):
+    """Three-marker pad with the given edge lengths [m], placed so they never overlap:
+    large on the left, medium top-right, small centred."""
+    gap = 0.02
+    cx_large = -(small / 2 + gap + large / 2)
+    c_medium = min(0.5 - medium / 2, small / 2 + gap + medium / 2)
+    return PadLayout(markers=(
+        PadMarker(0, large, max(cx_large, -0.5 + large / 2), 0.0, 'large'),
+        PadMarker(1, medium, c_medium, c_medium, 'medium'),
+        PadMarker(2, small, 0.0, 0.0, 'small'),
+    ))
+
+
+class _LabView(PipelineObserver):
+    """Latest camera frame (as JPEG), detections and estimates for the UI."""
+
+    def __init__(self, K):
+        self.K = K
+        self.jpeg, self.jpeg_seq = None, 0
+        self.last_ids = []
+        self.est_out = {}
+        self.n_frames = self.n_det = 0
+
+    def on_frame(self, t, img, det, truth):
+        self.n_frames += 1
+        self.n_det += det is not None
+        self.last_ids = det.marker_ids if det else []
+        dbg = draw_detection(img, det, self.K)
+        if dbg.shape[1] > 640:
+            dbg = cv2.resize(dbg, (640, int(640 * dbg.shape[0] / dbg.shape[1])), interpolation=cv2.INTER_AREA)
+        ok, jpg = cv2.imencode('.jpg', dbg, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        self.jpeg, self.jpeg_seq = jpg.tobytes(), self.jpeg_seq + 1
+
+    def on_estimates(self, t_img, det, outs, truth):
+        self.est_out.update(outs)
+
+
 class Lab:
     def __init__(self):
         self.p = {k: it['default'] for k, it in ITEMS.items()}
@@ -140,56 +179,38 @@ class Lab:
         self.reset()
 
     # -- setup ---------------------------------------------------------------------------
+    def _motion(self):
+        """Vehicle motion that reads the live sliders on every call."""
+        scen = self.p['scenario']
+        if scen == 'manual':
+            return Scenario(lambda t: self.p['manual_speed'],
+                            lambda t: math.radians(self.p['manual_turn']), 'Manual')
+        base = SCENARIOS[scen]
+        return Scenario(lambda t: self.p['speed_scale'] * base.speed(t), base.yaw_rate,
+                        base.description)
+
     def reset(self):
         with self.lock:
             p = self.p
-            self._set_pad(p['m_large'] / 100, p['m_medium'] / 100, p['m_small'] / 100)
             w, h = (int(x) for x in p['resolution'].split('x'))
-            scen = p['scenario']
-            cfg = WorldConfig(scenario='static' if scen == 'manual' else scen, seed=int(p['seed']),
+            cfg = WorldConfig(scenario=p['scenario'], motion=self._motion(), seed=int(p['seed']),
                               drone_start=(-2.0, 1.5, p['start_alt']), cam_width=w, cam_height=h,
-                              cam_hfov_deg=p['hfov'])
+                              cam_hfov_deg=p['hfov'], deck_height=p['deck_height'],
+                              pad=pad_layout(p['m_large'] / 100, p['m_medium'] / 100,
+                                             p['m_small'] / 100))
             self.world = World(cfg)
-            veh = self.world.vehicle
-            veh.deck_height = p['deck_height']
-            veh.p[2] = p['deck_height']
-            if scen == 'manual':
-                veh.speed_fn = lambda t: self.p['manual_speed']
-                veh.yaw_rate_fn = lambda t: math.radians(self.p['manual_turn'])
-            else:
-                base = SCENARIOS[scen][0]
-                veh.speed_fn = lambda t, base=base: self.p['speed_scale'] * base(t)
-            self.detector = PadDetector(self.world.camera.K, self.world.camera.dist)
-            self.ests = {k: c() for k, c in ESTIMATORS.items()}
-            self.ctrl = LandingController(LandingParams())
-            self.buf = DroneStateBuffer()
-            self.pending = []
-            self.v_cmd, self.motors = np.zeros(3), True
-            self.next_cam = self.next_ctrl = 0.0
-            self.last_det, self.last_ids = None, []
-            self.jpeg, self.jpeg_seq = None, 0
-            self.est_out = {}
-            self.t_end = None
-            self.n_frames = self.n_det = 0
+            self.view = _LabView(self.world.camera.K)
+            # the lab keeps a finished run on screen instead of ending it when the pad is lost
+            self.pipe = LandingPipeline(self.world, PipelineConfig(dt=DT, give_up_after=None),
+                                        observers=[self.view])
             self.apply_live()
 
-    @staticmethod
-    def _set_pad(large, medium, small):
-        # keep markers from overlapping: large on the left, medium top-right, small centred
-        gap = 0.02
-        cx_large = -(small / 2 + gap + large / 2)
-        markers = (
-            padmod.PadMarker(0, large, max(cx_large, -0.5 + large / 2), 0.0, 'large'),
-            padmod.PadMarker(1, medium, min(0.5 - medium / 2, small / 2 + gap + medium / 2),
-                             min(0.5 - medium / 2, small / 2 + gap + medium / 2), 'medium'),
-            padmod.PadMarker(2, small, 0.0, 0.0, 'small'),
-        )
-        padmod.PAD_MARKERS = markers
-        padmod.MARKERS_BY_ID.clear()
-        padmod.MARKERS_BY_ID.update({m.marker_id: m for m in markers})
+    @property
+    def ctrl(self):
+        return self.pipe.controller
 
     def apply_live(self):
-        p, w = self.p, self.world
+        p, w, pipe = self.p, self.world, self.pipe
         q = w.quad.prm
         q.tau_vel, q.ki_vel, q.a_max_xy = p['tau_vel'], p['ki_vel'], p['a_max_xy']
         q.tilt_max = math.radians(p['tilt_max'])
@@ -197,8 +218,10 @@ class Lab:
         w.wind.mean = np.array([p['wind_x'], p['wind_y'], 0.0])
         w.cfg.att_noise_deg, w.cfg.vel_noise = p['att_noise'], p['vel_noise']
         w.renderer.noise_std, w.renderer.blur_sigma = p['img_noise'], p['blur']
-        self.detector.min_side_px = p['min_side_px']
-        kf = self.ests['corrected']
+        pipe.detector.min_side_px = p['min_side_px']
+        pipe.cfg.mode, pipe.cfg.cam_hz = p['mode'], p['cam_hz']
+        pipe.cfg.latency = p['latency'] / 1000.0
+        kf = pipe.estimators['corrected']
         kf.q, kf.meas_per_m, kf.gate = p['kf_q'], p['kf_meas'], p['kf_gate']
         for k in CTRL_KEYS & set(p):
             setattr(self.ctrl.p, k, float(p[k]))
@@ -223,52 +246,6 @@ class Lab:
             self.apply_live()
         return need_reset
 
-    # -- one physics step (same pipeline as core/sim_runner.py) ---------------------------
-    def step(self):
-        w, p = self.world, self.p
-        t = w.t
-        p_fc, v_fc, R_fc = w.fc_estimate()
-        self.buf.add(t, p_fc, v_fc, R_fc)
-        drone_now = (t, p_fc, v_fc, R_fc)
-
-        if t >= self.next_cam - 1e-9:
-            self.next_cam = t + 1.0 / p['cam_hz']
-            img = w.render()
-            det = self.detector.detect(img)
-            self.n_frames += 1
-            self.n_det += det is not None
-            self.pending.append((t + p['latency'] / 1000.0, t, det))
-            self.last_ids = det.marker_ids if det else []
-            dbg = draw_detection(img, det, w.camera.K)
-            if dbg.shape[1] > 640:
-                dbg = cv2.resize(dbg, (640, int(640 * dbg.shape[0] / dbg.shape[1])), interpolation=cv2.INTER_AREA)
-            ok, jpg = cv2.imencode('.jpg', dbg, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            self.jpeg, self.jpeg_seq = jpg.tobytes(), self.jpeg_seq + 1
-
-        while self.pending and self.pending[0][0] <= t + 1e-9:
-            _, t_img, det = self.pending.pop(0)
-            if det is None:
-                continue
-            d_img = self.buf.at(t_img)
-            for k, e in self.ests.items():
-                out = e.update(t_img, det, d_img)
-                if out is not None:
-                    self.est_out[k] = out
-
-        if t >= self.next_ctrl - 1e-9:
-            self.next_ctrl = t + 0.02
-            mode = p['mode']
-            est = self.ests[mode].predict(t, drone_now)
-            if est is not None and mode != 'corrected' and t - est['t'] > 0.5:
-                est = None
-            if w.outcome is None:
-                self.v_cmd, self.motors = self.ctrl.step(t, est, p_fc, v_fc)
-
-        w.step(DT, self.v_cmd, self.motors)
-        if w.outcome is not None and self.t_end is None:
-            self.ctrl.touchdown(w.t)
-            self.t_end = w.t
-
     def run(self):
         last = time.perf_counter()
         while True:
@@ -282,47 +259,33 @@ class Lab:
                 if self.running or self.step_once:
                     n = max(1, int(round(min(wall_dt, 0.1) * self.p['sim_speed'] / DT))) if self.running else int(0.1 / DT)
                     for _ in range(n):
-                        self.step()
+                        self.pipe.step()
                     self.step_once = False
                 ar = self.p['auto_reset']
-                if ar and self.t_end is not None and self.world.t - self.t_end > ar:
+                if ar and self.pipe.t_end is not None and self.world.t - self.pipe.t_end > ar:
                     self.reset()
             time.sleep(0.005)
 
     # -- telemetry -----------------------------------------------------------------------
     def snapshot(self):
         with self.lock:
-            w, s, v = self.world, self.world.quad.s, self.world.vehicle
+            w, s, v, view = self.world, self.world.quad.s, self.world.vehicle, self.view
             tr = w.truth()
-            ests = {}
-            for k, o in self.est_out.items():
-                rp, sp = o.get('rel_pos'), o.get('speed')
-                ests[k] = dict(rel=[_f(rp[0]), _f(rp[1])] if rp is not None else None, speed=_f(sp),
-                               alt=_f(o.get('altitude')))
+            ests = {k: dict(rel=rounded(o.rel_pos[:2]), speed=rounded(o.speed), alt=rounded(o.altitude))
+                    for k, o in view.est_out.items()}
             return dict(
                 t=round(w.t, 3), running=self.running, state=self.ctrl.state, aborts=self.ctrl.n_aborts,
-                drone=dict(p=_l(s.p), v=_l(s.v), roll=_f(math.degrees(s.roll)), pitch=_f(math.degrees(s.pitch)),
+                drone=dict(p=rounded(s.p), v=rounded(s.v), roll=rounded(math.degrees(s.roll)), pitch=rounded(math.degrees(s.pitch)),
                            motors=s.motors_on),
-                pad=dict(p=_l(v.p), v=_l(v.v), yaw=_f(v.yaw),
-                         markers=[[m.size, m.cx, m.cy] for m in padmod.PAD_MARKERS]),
-                rel=_l(tr['rel_p']), rel_speed=_f(tr['rel_speed']), tgt_speed=_f(tr['tgt_speed']),
-                hcam=_f(tr['cam_height']), tilt=_f(math.degrees(math.hypot(s.roll, s.pitch))),
-                cmd=_l(self.v_cmd), ids=self.last_ids, ests=ests,
-                impact=_l(self.ctrl.predicted_impact) if self.ctrl.predicted_impact is not None else None,
-                outcome=w.outcome, det_rate=_f(self.n_det / max(1, self.n_frames)),
-                mode=self.p['mode'], frame_seq=self.jpeg_seq, viewers=self.clients, public=PUBLIC)
+                pad=dict(p=rounded(v.p), v=rounded(v.v), yaw=rounded(v.yaw),
+                         markers=[[m.size, m.cx, m.cy] for m in w.cfg.pad.markers]),
+                rel=rounded(tr['rel_p']), rel_speed=rounded(tr['rel_speed']), tgt_speed=rounded(tr['tgt_speed']),
+                hcam=rounded(tr['cam_height']), tilt=rounded(math.degrees(math.hypot(s.roll, s.pitch))),
+                cmd=rounded(self.pipe.v_cmd), ids=view.last_ids, ests=ests,
+                impact=rounded(self.ctrl.predicted_impact),
+                outcome=w.outcome, det_rate=rounded(view.n_det / max(1, view.n_frames)),
+                mode=self.p['mode'], frame_seq=view.jpeg_seq, viewers=self.clients, public=PUBLIC)
 
-
-def _f(x):
-    try:
-        x = float(x)
-    except (TypeError, ValueError):
-        return None
-    return round(x, 4) if math.isfinite(x) else None
-
-
-def _l(a):
-    return [_f(x) for x in np.asarray(a, float).ravel()]
 
 
 LAB = None
@@ -369,8 +332,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             while True:
                 snap = LAB.snapshot()
-                if snap['frame_seq'] != sent_seq and LAB.jpeg is not None:
-                    snap['frame'] = base64.b64encode(LAB.jpeg).decode()
+                jpeg = LAB.view.jpeg
+                if snap['frame_seq'] != sent_seq and jpeg is not None:
+                    snap['frame'] = base64.b64encode(jpeg).decode()
                     sent_seq = snap['frame_seq']
                 self.wfile.write(f'data: {json.dumps(snap)}\n\n'.encode())
                 self.wfile.flush()

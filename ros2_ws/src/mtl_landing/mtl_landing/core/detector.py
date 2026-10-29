@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from .pad import MARKERS_BY_ID, aruco_dictionary, marker_object_points
+from .pad import DEFAULT_PAD, PadLayout
 
 
 @dataclass
@@ -42,21 +42,24 @@ def _make_detect_fn(dictionary):
 
 
 class PadDetector:
-    def __init__(self, K, dist=None, use_board_refinement=True, min_side_px=14.0):
+    def __init__(self, K, dist=None, layout: PadLayout = DEFAULT_PAD, use_board_refinement=True,
+                 min_side_px=14.0):
         self.K = np.asarray(K, float)
         self.dist = np.zeros(5) if dist is None else np.asarray(dist, float)
-        self.dictionary = aruco_dictionary()
+        self.layout = layout
+        self.markers = layout.by_id
+        self.dictionary = layout.dictionary()
         self._detect = _make_detect_fn(self.dictionary)
         self.use_board = use_board_refinement
         self.min_side_px = min_side_px
-        self.obj = {mid: marker_object_points(m) for mid, m in MARKERS_BY_ID.items()}
+        self.obj = layout.object_points()
 
     def detect(self, gray):
         corners, ids, _ = self._detect(gray)
         if ids is None:
             return None
         found = [(int(i), c.reshape(4, 2).astype(np.float64))
-                 for i, c in zip(ids.flatten(), corners) if int(i) in MARKERS_BY_ID]
+                 for i, c in zip(ids.flatten(), corners) if int(i) in self.markers]
         # markers only a few pixels across give unreliable depth: drop them
         found = [(i, c) for i, c in found
                  if np.min(np.linalg.norm(c - np.roll(c, 1, axis=0), axis=1)) >= self.min_side_px]
@@ -66,7 +69,7 @@ class PadDetector:
         # Paper's method: single-marker pose of the most prominent marker
         areas = [cv2.contourArea(c.astype(np.float32)) for _, c in found]
         pid, pc = found[int(np.argmax(areas))]
-        m = MARKERS_BY_ID[pid]
+        m = self.markers[pid]
         h = m.size / 2.0
         obj_local = np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]], np.float64)
         ok, rvec, tvec = cv2.solvePnP(obj_local, pc, self.K, self.dist,

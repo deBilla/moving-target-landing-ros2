@@ -6,6 +6,7 @@ from mtl_landing.core.camera import PinholeCamera, SceneRenderer
 from mtl_landing.core.detector import PadDetection, PadDetector
 from mtl_landing.core.estimation import CorrectedEstimator, PaperEstimator
 from mtl_landing.core.geometry import euler_to_R, rot_z
+from mtl_landing.core.state import DroneState
 
 
 def literal_distance(t1, t2):
@@ -42,7 +43,7 @@ def test_angle_ratio_is_bearing_not_direction_of_motion():
     est = PaperEstimator()
     est.update(0.0, det_at((1.0, 1.0, 4.0)))
     out = est.update(0.1, det_at((1.05, 1.0, 4.0)))
-    assert out['angle_ratio'] == pytest.approx(1.0 / 1.05)
+    assert out.angle_ratio == pytest.approx(1.0 / 1.05)
 
 
 def test_corrected_measurement_compensates_tilt():
@@ -56,7 +57,7 @@ def test_corrected_measurement_compensates_tilt():
     tvec = R_wc.T @ (p_pad - p_wc)
     # the camera-frame offset is ~1 m even though the pad is right below
     assert np.hypot(tvec[0], tvec[1]) > 0.9
-    z, _ = CorrectedEstimator.measurement(det_at(tvec), (0.0, p_d, np.zeros(3), R_wb))
+    z, _ = CorrectedEstimator.measurement(det_at(tvec), DroneState(0.0, p_d, np.zeros(3), R_wb))
     assert np.allclose(z, p_pad, atol=1e-9)
 
 
@@ -76,5 +77,5 @@ def test_detector_recovers_pad_pose_from_rendered_image(height, tilt_deg):
     img = rnd.render(R_wb, p_d, R_pad, p_pad)
     d = det.detect(img)
     assert d is not None
-    z, _ = CorrectedEstimator.measurement(d, (0.0, p_d, np.zeros(3), R_wb))
+    z, _ = CorrectedEstimator.measurement(d, DroneState(0.0, p_d, np.zeros(3), R_wb))
     assert np.linalg.norm(z - p_pad) < 0.02 + 0.01 * height

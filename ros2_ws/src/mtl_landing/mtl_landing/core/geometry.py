@@ -18,6 +18,8 @@ R_BODY_CAM = np.array([
 # Camera lens position relative to the centre of gravity, in the body frame [m]
 P_BODY_CAM = np.array([0.0, 0.0, -0.05])
 
+G = 9.81                     # gravity [m/s^2], along world -z
+
 
 def rot_x(a):
     c, s = np.cos(a), np.sin(a)

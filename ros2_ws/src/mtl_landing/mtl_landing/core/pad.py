@@ -12,6 +12,9 @@ during the final approach; the camera footprint at 0.3 m altitude is only ~0.42 
 
 Pad frame: origin at pad centre, x to the right, y forward ("up" in the texture),
 z out of the pad surface.
+
+A PadLayout is an immutable value. The renderer and the detector each take one, so a
+different pad is a different object passed in, never a module global changed at runtime.
 """
 from dataclasses import dataclass
 
@@ -31,14 +34,34 @@ class PadMarker:
     label: str
 
 
+@dataclass(frozen=True)
+class PadLayout:
+    markers: tuple
+    size: float = PAD_SIZE_M             # square board edge [m]
+    dictionary_name: str = ARUCO_DICT_NAME
+
+    @property
+    def by_id(self):
+        return {m.marker_id: m for m in self.markers}
+
+    def dictionary(self):
+        return aruco_dictionary(self.dictionary_name)
+
+    def object_points(self):
+        """{marker id: 3D corners in the pad frame}."""
+        return {m.marker_id: marker_object_points(m) for m in self.markers}
+
+    def texture(self, px_per_m=1000):
+        return make_pad_texture(self, px_per_m)
+
+
 # The paper gives no marker sizes. The small one is sized so it stays fully in a 70 deg
 # camera's footprint at 0.3 m with up to ~8 cm of misalignment (a 10 cm marker needed < 3 cm).
-PAD_MARKERS = (
+DEFAULT_PAD = PadLayout(markers=(
     PadMarker(0, 0.32, -0.27, 0.00, 'large'),
     PadMarker(1, 0.20, 0.25, 0.24, 'medium'),
     PadMarker(2, 0.16, 0.00, 0.00, 'small'),
-)
-MARKERS_BY_ID = {m.marker_id: m for m in PAD_MARKERS}
+))
 
 
 def aruco_dictionary(name=ARUCO_DICT_NAME):
@@ -63,17 +86,17 @@ def marker_object_points(m: PadMarker) -> np.ndarray:
     ], dtype=np.float64)
 
 
-def make_pad_texture(px_per_m=1000, dictionary=None):
-    """White square board with the three markers drawn at their pad-frame positions."""
-    dictionary = dictionary if dictionary is not None else aruco_dictionary()
-    n = int(round(PAD_SIZE_M * px_per_m))
+def make_pad_texture(layout: PadLayout = DEFAULT_PAD, px_per_m=1000):
+    """White square board with the markers drawn at their pad-frame positions."""
+    dictionary = layout.dictionary()
+    n = int(round(layout.size * px_per_m))
     tex = np.full((n, n), 255, np.uint8)
-    for m in PAD_MARKERS:
+    for m in layout.markers:
         s = int(round(m.size * px_per_m))
         img = marker_image(dictionary, m.marker_id, s)
         # texture column grows with +x, row grows with -y
-        u0 = int(round((m.cx - m.size / 2 + PAD_SIZE_M / 2) * px_per_m))
-        v0 = int(round((PAD_SIZE_M / 2 - (m.cy + m.size / 2)) * px_per_m))
+        u0 = int(round((m.cx - m.size / 2 + layout.size / 2) * px_per_m))
+        v0 = int(round((layout.size / 2 - (m.cy + m.size / 2)) * px_per_m))
         tex[v0:v0 + s, u0:u0 + s] = img
     # thin grey outline so the pad edge is visible against a light deck
     cv2.rectangle(tex, (0, 0), (n - 1, n - 1), 120, max(2, n // 200))

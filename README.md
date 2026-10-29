@@ -54,11 +54,15 @@ literally so the effect can be measured.
  sim_world ──/camera/image_raw──▶ aruco_detector ──/pad/pose──▶ target_estimator
      ▲   └──/drone/odom (flight-controller state)──────────────▶   │ mode: paper|naive|
      │                                                             │ compensated|corrected
-     └──/drone/cmd_vel, /drone/motors◀── landing_controller ◀──/target/relative
+     └──/drone/cmd_vel, /drone/motors◀── landing_controller ◀──/target/estimate
  flight_logger records truth + all estimators + debug frames → results/ros_run_*.json
 ```
 
-* `core/` is pure Python (numpy + OpenCV) and shared by the ROS nodes and the batch runner.
+* `core/` is pure Python (numpy + OpenCV) and shared by the ROS nodes, the batch runner and
+  the sim lab. `core/pipeline.py` is the one closed loop (camera → detector → estimators →
+  controller → physics) that the batch runner, the sim lab and the speed sweep all drive.
+  Estimators implement `core.estimation.Estimator` and return a typed `core.state.Estimate`;
+  the estimator node sends that same `Estimate` to the controller node on `/target/estimate`.
 * **sim_world** has quadrotor dynamics (velocity loop with integral action, tilt with
   first-order lag, drag, Ornstein–Uhlenbeck wind gusts), a ground vehicle with 7 motion
   scenarios, and a **rendered downward camera** (800×600, 70° HFOV, 30 Hz) that warps the
